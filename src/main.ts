@@ -4,8 +4,8 @@ Devvit.configure({
     redditAPI: true
 });
 
-const aiQuestionAsk = "Thanks for posting to r/selfhosted. Your post has been temporarily removed. Please reply to this comment explaining how AI was used in the creation of your project. Once you reply, your post will be automatically approved.";
-const aiQuestionAnswered = "Expand the replies to this comment to learn how AI was used in this project";
+const aiQuestionAsk = "Thanks for posting to r/selfhosted. Your post has been temporarily removed. Please reply to this comment explaining how AI was used in the creation of your post/project. Once you reply, your post will be automatically approved.";
+const aiQuestionAnswered = "Expand the replies to this comment to learn how AI was used in this post/project";
 
 // 1. TRIGGER: When a new post is submitted
 Devvit.addTrigger({
@@ -71,7 +71,7 @@ Devvit.addTrigger({
                     const parentComment = await context.reddit.getCommentById(fullComment.parentId);
                     
                     // We use .includes() instead of strict === in case Reddit formats the text slightly
-                    if (parentComment.body.includes("how AI was used in the creation of your project")) {
+                    if (parentComment.body.includes("how AI was used in the creation of your post/project")) {
                         console.log(`[MATCH FOUND] OP replied to the bot's AI question. Approving post...`);
                         
                         // Approve the post
