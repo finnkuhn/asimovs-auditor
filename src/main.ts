@@ -14,11 +14,17 @@ Devvit.addTrigger({
         const postV2 = event.post;
         if (!postV2) return;
 
-        // --- NEW FLAIR FILTER LOGIC ---
-        const flairText = postV2.linkFlair?.text;
+        // Fetch the full post object immediately
+        const post = await context.reddit.getPostById(postV2.id);
+
+        // --- FILTER LOGIC ---
         
-        // ONLY act on "Release (AI)", you could add:
-        if (flairText !== "Release (AI)") return;
+        // 1. Ignore posts by AutoModerator
+        // We use .authorName from the full post object
+        if (post.authorName === "AutoModerator") {
+            console.log(`[SKIPPED] Post ${post.id} is by AutoModerator.`);
+            return;
+        }
 
         try {
             const post = await context.reddit.getPostById(postV2.id);
