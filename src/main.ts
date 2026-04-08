@@ -9,7 +9,7 @@ Devvit.configure({
 
 const aiQuestionAsk = "Thanks for posting to r/selfhosted. Your post has been temporarily removed. Please reply to this comment explaining how AI was used in the creation of your post/project. Once you reply, your post will be automatically approved.";
 const aiQuestionAnswered = "Expand the replies to this comment to learn how AI was used in this post/project";
-const projectTooNewMsg = `Thanks for posting to r/selfhosted. Your post has been removed. The linked GitHub project was created less than 3 months ago. Please share your project in the [current New Project Megathread](https://www.reddit.com/r/selfhosted/search/?q="New%20Project%20Megathread%20-"&type=posts&sort=new) instead.`;
+const projectTooNewMsg = `Thanks for posting to r/selfhosted. Your post has been removed. Please share your project in the [current New Project Megathread](https://www.reddit.com/r/selfhosted/search/?q="New%20Project%20Megathread%20-"&type=posts&sort=new) instead.`;
 
 // Helper function to extract GitHub owner and repo from text
 function getGithubRepos(text: string): { owner: string, repo: string }[] {
@@ -71,6 +71,13 @@ Devvit.addSchedulerJob({
             // If a repo is less than 3 months old, remove it and exit early
             if (isTooNew) {
                 await post.remove();
+                
+                // Add the internal mod note for the removal reason
+                await post.addRemovalNote({
+                    reasonId: "6",
+                    modNote: "GitHub project too new (< 3 months)"
+                });
+
                 console.log(`[POST REMOVED] Post ${post.id} removed: GitHub project too new.`);
 
                 const comment = await context.reddit.submitComment({
