@@ -72,11 +72,17 @@ Devvit.addSchedulerJob({
             if (isTooNew) {
                 await post.remove();
                 
-                // Add the internal mod note for the removal reason
-                await post.addRemovalNote({
-                    reasonId: "6",
-                    modNote: "GitHub project too new (< 3 months)"
-                });
+                try {
+                    // Add the internal mod note for the removal reason
+                    await post.addRemovalNote({
+                        reasonId: "015176e6-83e3-4b30-8258-47fbb4d2ed16",
+                        modNote: "GitHub project too new (< 3 months)"
+                    });
+                    console.log(`[MOD NOTE ADDED] for post ${post.id}`);
+                } catch (e) {
+                    // Log the error but don't stop the script
+                    console.error(`[MOD NOTE ERROR] Failed to add removal note for ${post.id}:`, e);
+                }
 
                 console.log(`[POST REMOVED] Post ${post.id} removed: GitHub project too new.`);
 
