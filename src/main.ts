@@ -75,7 +75,7 @@ Devvit.addSchedulerJob({
                 try {
                     // Add the internal mod note for the removal reason
                     await post.addRemovalNote({
-                        reasonId: "015176e6-83e3-4b30-8258-47fbb4d2ed16",
+                        reasonId: "015176e6-83e3-4b30-8258-47fbb4d2ed16", // Removal UUID, retrieved via API, or APP https://developers.reddit.com/apps/removalreasonids
                         modNote: "GitHub project too new (< 3 months)"
                     });
                     console.log(`[MOD NOTE ADDED] for post ${post.id}`);
