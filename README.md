@@ -1,4 +1,4 @@
-# Asimovs-Auditor
+# Asimov's Auditor
 
 This is the official bot for moderating r/selfhosted. 
 When a new Post is made it comments under the post and asks how AI was used. 
