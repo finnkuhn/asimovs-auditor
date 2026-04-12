@@ -14,10 +14,22 @@ const projectTooNewMsg = `Thanks for posting to r/selfhosted. Your post has been
 // Helper function to extract GitHub owner and repo from text
 function getGithubRepos(text: string): { owner: string, repo: string }[] {
     if (!text) return [];
-    // Matches https://github.com/Owner/RepoName
-    const regex = /https?:\/\/(?:www\.)?github\.com\/([a-zA-Z0-9_-]+)\/([a-zA-Z0-9_-]+)/gi;
+    
+    // Made https:// optional so it catches "github.com/owner/repo"
+    const regex = /(?:https?:\/\/)?(?:www\.)?github\.com\/([a-zA-Z0-9_-]+)\/([a-zA-Z0-9_-]+)/gi;
     const matches = [...text.matchAll(regex)];
-    return matches.map(match => ({ owner: match[1], repo: match[2] }));
+    
+    // Use a Map to deduplicate repos (prevents hitting API 3x for the same link)
+    const uniqueRepos = new Map<string, { owner: string, repo: string }>();
+    
+    matches.forEach(match => {
+        const owner = match[1];
+        // Remove trailing dots, git extensions, or slashes that might get caught
+        const repo = match[2].replace(/\.git$/, "").replace(/[\/\.]+$/, "");
+        uniqueRepos.set(`${owner}/${repo}`, { owner, repo });
+    });
+
+    return Array.from(uniqueRepos.values());
 }
 
 // 1. Define the background job that runs AFTER the 5 seconds
@@ -46,9 +58,19 @@ Devvit.addSchedulerJob({
             
             let isTooNew = false;
 
+            if (allRepos.length > 0) {
+                console.log(`[GITHUB CHECK] Found ${allRepos.length} unique GitHub links to check.`);
+            }
+
             for (const repo of allRepos) {
                 try {
-                    const response = await fetch(`https://api.github.com/repos/${repo.owner}/${repo.repo}`);
+                    const response = await fetch(`https://api.github.com/repos/${repo.owner}/${repo.repo}`, {
+                        headers: {
+                            'User-Agent': 'Devvit-Selfhosted-Bot',
+                            'Accept': 'application/vnd.github.v3+json'
+                        }
+                    });
+
                     if (response.ok) {
                         const data = await response.json();
                         if (data.created_at) {
@@ -60,8 +82,16 @@ Devvit.addSchedulerJob({
                                 isTooNew = true;
                                 console.log(`[GITHUB CHECK] Repo ${repo.owner}/${repo.repo} is too new (${data.created_at}).`);
                                 break; // Stop checking if we find at least one new repo
+                            } else {
+                                console.log(`[GITHUB CHECK] Repo ${repo.owner}/${repo.repo} is old enough.`);
                             }
                         }
+                    } else {
+                        // THIS LOG WILL TELL YOU IF GITHUB IS RATE LIMITING YOU
+                        console.error(`[GITHUB API ERROR] Failed to fetch ${repo.owner}/${repo.repo}. Status: ${response.status} ${response.statusText}`);
+                        
+                        // If rate limited (403), stop querying to avoid permanent bans
+                        if (response.status === 403) break; 
                     }
                 } catch (apiError) {
                     console.error(`[ERROR] Failed to fetch GitHub API for ${repo.owner}/${repo.repo}:`, apiError);
