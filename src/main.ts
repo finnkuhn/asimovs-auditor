@@ -77,7 +77,11 @@ Devvit.addSchedulerJob({
                             reasonId: "b82f1872-23b1-468e-8b5d-d2514110fcc2", // Removal UUID, retrieved via API, or APP https://developers.reddit.com/apps/removalreasonids
                             modNote: "Not Wednesday anywhere [Asimov's Auditor]"
                         });
-                    } catch (e) { /* Ignore mod note errors */ }
+                        console.log(`[MOD NOTE ADDED] for post ${post.id}`);
+                    } catch (e) {
+                        // Log the error but don't stop the script
+                        console.error(`[MOD NOTE ERROR] Failed to add removal note for ${post.id}:`, e);
+                    }
 
                     const comment = await context.reddit.submitComment({
                         id: post.id,
