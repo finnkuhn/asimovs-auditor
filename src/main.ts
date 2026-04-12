@@ -10,6 +10,20 @@ Devvit.configure({
 const aiQuestionAsk = "Thanks for posting to r/selfhosted. Your post has been temporarily removed. Please reply to this comment explaining how AI was used in the creation of your post/project. Once you reply, your post will be automatically approved. To learn more about why this is required, please see our [pinned post](https://www.reddit.com/r/selfhosted/comments/1sey9ch/quarter_2_update_revisiting_rules_again/).";
 const aiQuestionAnswered = "Expand the replies to this comment to learn how AI was used in this post/project.";
 const projectTooNewMsg = `Thanks for posting to r/selfhosted. Your post has been removed. Please share your project in the [current New Project Megathread](https://www.reddit.com/r/selfhosted/search/?q="New%20Project%20Megathread%20-"&type=posts&sort=new) instead or see rule 6 for more information.`;
+const wednesdayExceptionMsg = `Thanks for posting to r/selfhosted. Your post has been removed. Please check the day of the week and make sure it is Wednesday (see rule 5 for more information).`;
+
+// Helper: Check if it is Wednesday ANYWHERE on Earth
+function isWednesdaySomewhere(): boolean {
+    const now = new Date();
+    const utcDay = now.getUTCDay();   // 0 = Sun, 1 = Mon, 2 = Tue, 3 = Wed, 4 = Thu, 5 = Fri, 6 = Sat
+    const utcHours = now.getUTCHours();
+
+    if (utcDay === 3) return true; // It is currently Wednesday in UTC
+    if (utcDay === 2 && utcHours >= 10) return true; // Wednesday has started in UTC+14 (e.g., Kiribati)
+    if (utcDay === 4 && utcHours < 12) return true; // Wednesday has not yet ended in UTC-12 (e.g., Baker Island)
+    
+    return false;
+}
 
 // Helper function to extract GitHub owner and repo from text
 function getGithubRepos(text: string): { owner: string, repo: string }[] {
@@ -51,7 +65,36 @@ Devvit.addSchedulerJob({
                 return; 
             }
 
-            // --- GITHUB REPO AGE CHECK ---
+            // --- 1. WEDNESDAY EXCEPTION CHECK ---
+            // Assuming users identify this via a Post Flair containing "Wednesday"
+            const flairText = post.flair?.text?.toLowerCase() || "";
+            if (flairText.includes("wednesday exception")) {
+                if (!isWednesdaySomewhere()) {
+                    await post.remove();
+                    
+                    try {
+                        await post.addRemovalNote({
+                            reasonId: "b82f1872-23b1-468e-8b5d-d2514110fcc2", // Removal UUID, retrieved via API, or APP https://developers.reddit.com/apps/removalreasonids
+                            modNote: "Not Wednesday anywhere [Asimov's Auditor]"
+                        });
+                    } catch (e) { /* Ignore mod note errors */ }
+
+                    const comment = await context.reddit.submitComment({
+                        id: post.id,
+                        text: wednesdayExceptionMsg,
+                    });
+
+                    await comment.distinguish(true);
+                    await comment.lock();
+                    console.log(`[POST REMOVED] Post ${post.id} removed: Wednesday Exception rule violation.`);
+                    
+                    return; // EXIT EARLY: Don't check GitHub or AI if removed for Wednesday
+                } else {
+                    console.log(`[WEDNESDAY CHECK] Passed. It is Wednesday somewhere.`);
+                }
+            }
+
+            // --- 2. GITHUB REPO AGE CHECK ---
             const urlRepos = getGithubRepos(post.url || "");
             const bodyRepos = getGithubRepos(post.body || "");
             const allRepos = [...urlRepos, ...bodyRepos];
