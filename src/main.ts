@@ -7,9 +7,9 @@ Devvit.configure({
     http: true
 });
 
-const aiQuestionAsk = "Thanks for posting to r/selfhosted. Your post has been temporarily removed. Please reply to this comment explaining how AI was used in the creation of your post/project. Once you reply, your post will be automatically approved.";
-const aiQuestionAnswered = "Expand the replies to this comment to learn how AI was used in this post/project";
-const projectTooNewMsg = `Thanks for posting to r/selfhosted. Your post has been removed. Please share your project in the [current New Project Megathread](https://www.reddit.com/r/selfhosted/search/?q="New%20Project%20Megathread%20-"&type=posts&sort=new) instead.`;
+const aiQuestionAsk = "Thanks for posting to r/selfhosted. Your post has been temporarily removed. Please reply to this comment explaining how AI was used in the creation of your post/project. Once you reply, your post will be automatically approved. To learn more about why this is required, please see our [pinned post](https://www.reddit.com/r/selfhosted/comments/1sey9ch/quarter_2_update_revisiting_rules_again/).";
+const aiQuestionAnswered = "Expand the replies to this comment to learn how AI was used in this post/project.";
+const projectTooNewMsg = `Thanks for posting to r/selfhosted. Your post has been removed. Please share your project in the [current New Project Megathread](https://www.reddit.com/r/selfhosted/search/?q="New%20Project%20Megathread%20-"&type=posts&sort=new) instead or see rule 6 for more information.`;
 
 // Helper function to extract GitHub owner and repo from text
 function getGithubRepos(text: string): { owner: string, repo: string }[] {
@@ -204,9 +204,11 @@ Devvit.addTrigger({
                         // Update and lock the bot's comment
                         await parentComment.edit({ text: aiQuestionAnswered });
                         await parentComment.lock();
+                        await parentComment.approve();
                         console.log(`[COMMENT LOCKED] Bot comment updated and locked.`);
 
                         await fullComment.lock();
+                        await fullComment.approve();
                         console.log(`[OP REPLY LOCKED] OP's reply to the bot was locked.`);
                     }
                 }
