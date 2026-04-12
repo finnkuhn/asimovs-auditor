@@ -205,6 +205,9 @@ Devvit.addTrigger({
                         await parentComment.edit({ text: aiQuestionAnswered });
                         await parentComment.lock();
                         console.log(`[COMMENT LOCKED] Bot comment updated and locked.`);
+
+                        await fullComment.lock();
+                        console.log(`[OP REPLY LOCKED] OP's reply to the bot was locked.`);
                     }
                 }
             }
