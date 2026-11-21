@@ -6,3 +6,4 @@ public/*.js
 public/*.js.map
 .npmrc
 .nvmrc
+.venv
