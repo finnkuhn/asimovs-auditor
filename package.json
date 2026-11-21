@@ -9,13 +9,13 @@
     "dev": "dotenv -e .env -- devvit playtest",
     "login": "devvit login",
     "launch": "devvit publish",
-    "type-check": "tsc --build"
+    "type-check": "tsc -p ."
   },
   "dependencies": {
-    "@devvit/public-api": "0.12.17"
+    "@devvit/public-api": "0.15.4"
   },
   "devDependencies": {
-    "devvit": "0.12.17",
+    "devvit": "0.15.4",
     "dotenv-cli": "8.0.0",
     "typescript": "5.8.3"
   }

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://developers.reddit.com/schema/config-file.v1.json",
+  "name": "asimovs-auditor",
+  "blocks": {
+    "entry": "src/main.ts",
+    "triggers": ["onPostSubmit", "onCommentSubmit"]
+  },
+  "permissions": {
+    "reddit": {
+      "enable": true
+    },
+    "http": {
+      "enable": true,
+      "domains": ["api.github.com"]
+    }
+  }
+}

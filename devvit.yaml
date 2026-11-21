@@ -1,5 +1,0 @@
-name: Asimovs-Auditor
-permissions:
-  reddit:
-    asUser:
-      - SUBMITCOMMENT

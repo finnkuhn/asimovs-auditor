@@ -12,6 +12,11 @@ const aiQuestionAnswered = "Expand the replies to this comment to learn how AI w
 const projectTooNewMsg = `Thanks for posting to r/selfhosted. Your post has been removed. Please share your project in the [current New Project Megathread](https://www.reddit.com/r/selfhosted/search/?q="New%20Project%20Megathread%20-"&type=posts&sort=new) instead or see rule 6 for more information.`;
 const wednesdayExceptionMsg = `Thanks for posting to r/selfhosted. Your post has been removed. Please check the day of the week and make sure it is Wednesday (see rule 5 for more information).`;
 
+// Post flair template IDs that are only allowed on Wednesdays (in addition to any flair containing "Wednesday Exception")
+const WEDNESDAY_ONLY_FLAIR_IDS = [
+    "587d404a-7e68-11e9-bd12-0eb480af1d48", // Personal Dashboard
+];
+
 // Helper: Check if it is Wednesday ANYWHERE on Earth
 function isWednesdaySomewhere(): boolean {
     const now = new Date();
@@ -28,22 +33,58 @@ function isWednesdaySomewhere(): boolean {
 // Helper function to extract GitHub owner and repo from text
 function getGithubRepos(text: string): { owner: string, repo: string }[] {
     if (!text) return [];
-    
-    // Made https:// optional so it catches "github.com/owner/repo"
-    const regex = /(?:https?:\/\/)?(?:www\.)?github\.com\/([a-zA-Z0-9_-]+)\/([a-zA-Z0-9_-]+)/gi;
+
+    // Undo markdown escaping. Reddit's rich-text editor stores links behind text as
+    // "[text](https://github.com/foo\_bar/baz)", which would otherwise break the match.
+    text = text.replace(/\\([^a-zA-Z0-9\s])/g, "$1");
+
+    // Made https:// optional so it catches "github.com/owner/repo".
+    // The lookbehind stops subdomains like "gist.github.com" from matching.
+    // Repo names may contain dots (e.g. "owner/my.app"), so they are allowed here.
+    const regex = /(?<![a-z0-9.-])(?:https?:\/\/)?(?:www\.)?github\.com\/([a-z0-9_-]+)\/([a-z0-9_.-]+)/gi;
     const matches = [...text.matchAll(regex)];
-    
-    // Use a Map to deduplicate repos (prevents hitting API 3x for the same link)
-    const uniqueRepos = new Map<string, { owner: string, repo: string }>();
-    
+
+    const repos: { owner: string, repo: string }[] = [];
+
     matches.forEach(match => {
         const owner = match[1];
-        // Remove trailing dots, git extensions, or slashes that might get caught
-        const repo = match[2].replace(/\.git$/, "").replace(/[\/\.]+$/, "");
-        uniqueRepos.set(`${owner}/${repo}`, { owner, repo });
+        // Remove trailing dots (end of a sentence) and ".git" extensions
+        const repo = match[2].replace(/\.+$/, "").replace(/\.git$/i, "");
+        if (repo && repo !== "." && repo !== "..") {
+            repos.push({ owner, repo });
+        }
     });
 
+    return repos;
+}
+
+// Deduplicate repos (GitHub names are case-insensitive) so the API isn't hit twice for the same repo
+function dedupeRepos(repos: { owner: string, repo: string }[]): { owner: string, repo: string }[] {
+    const uniqueRepos = new Map<string, { owner: string, repo: string }>();
+    for (const r of repos) {
+        const key = `${r.owner}/${r.repo}`.toLowerCase();
+        if (!uniqueRepos.has(key)) uniqueRepos.set(key, r);
+    }
     return Array.from(uniqueRepos.values());
+}
+
+// Helper: Retry a Reddit API call on transient errors (gRPC "13 INTERNAL" / 500s and "8 RESOURCE_EXHAUSTED" rate limits).
+// Only use this for calls that are safe to repeat (reads, approve, remove, lock, edit, distinguish) — NOT submitComment,
+// which can fail with a 500 *after* the comment was created and would then post a duplicate.
+async function withRetry<T>(label: string, fn: () => Promise<T>, attempts = 3): Promise<T> {
+    for (let attempt = 1; ; attempt++) {
+        try {
+            return await fn();
+        } catch (error) {
+            const message = String((error as Error)?.message ?? error);
+            const isRateLimit = message.includes("RESOURCE_EXHAUSTED");
+            const isTransient = isRateLimit || message.includes("13 INTERNAL") || message.includes("500 Internal Server Error");
+            if (!isTransient || attempt >= attempts) throw error;
+            const delayMs = isRateLimit ? 6000 : 1000 * attempt;
+            console.warn(`[RETRY] ${label} failed (attempt ${attempt}/${attempts}), retrying in ${delayMs}ms: ${message}`);
+            await new Promise(resolve => setTimeout(resolve, delayMs));
+        }
+    }
 }
 
 // 1. Define the background job that runs AFTER the 5 seconds
@@ -52,7 +93,7 @@ Devvit.addSchedulerJob({
     onRun: async (event, context) => {
         try {
             const postId = event.data!.postId as string;
-            const post = await context.reddit.getPostById(postId);
+            const post = await withRetry("getPostById", () => context.reddit.getPostById(postId));
 
             // Safety check: Is this AutoModerator?
             if (post.authorName.toLowerCase() === "automoderator") {
@@ -60,23 +101,29 @@ Devvit.addSchedulerJob({
                 return; 
             }
 
-            if (post.isRemoved() || post.isSpam()) {
-                console.log(`[SKIPPED] Post ${post.id} was already removed by Reddit filters. Not interacting.`);
-                return; 
+            // Leave posts caught by Reddit's spam filters / AutoModerator in the mod queue for manual review.
+            // removedByCategory also covers filtered posts (e.g. "automod_filtered") that may not report isRemoved().
+            if (post.isRemoved() || post.isSpam() || post.removedByCategory) {
+                console.log(`[SKIPPED] Post ${post.id} was already removed or filtered (Category: ${post.removedByCategory ?? "none"}, spam: ${post.isSpam()}). Not interacting.`);
+                return;
             }
 
             // --- 1. WEDNESDAY EXCEPTION CHECK ---
-            // Assuming users identify this via a Post Flair containing "Wednesday"
+            // Applies to posts with the "Wednesday Exception" or "Personal Dashboard" flair
             const flairText = post.flair?.text?.toLowerCase() || "";
-            if (flairText.includes("wednesday exception")) {
+            const flairTemplateId = post.flair?.templateId || "";
+            const isWednesdayOnlyFlair =
+                flairText.includes("wednesday exception") ||
+                WEDNESDAY_ONLY_FLAIR_IDS.includes(flairTemplateId);
+            if (isWednesdayOnlyFlair) {
                 if (!isWednesdaySomewhere()) {
-                    await post.remove();
+                    await withRetry("post.remove", () => post.remove());
                     
                     try {
-                        await post.addRemovalNote({
+                        await withRetry("addRemovalNote", () => post.addRemovalNote({
                             reasonId: "b82f1872-23b1-468e-8b5d-d2514110fcc2", // Removal UUID, retrieved via API, or APP https://developers.reddit.com/apps/removalreasonids
                             modNote: "Not Wednesday anywhere [Asimov's Auditor]"
-                        });
+                        }));
                         console.log(`[MOD NOTE ADDED] for post ${post.id}`);
                     } catch (e) {
                         // Log the error but don't stop the script
@@ -88,9 +135,9 @@ Devvit.addSchedulerJob({
                         text: wednesdayExceptionMsg,
                     });
 
-                    await comment.distinguish(true);
-                    await comment.lock();
-                    console.log(`[POST REMOVED] Post ${post.id} removed: Wednesday Exception rule violation.`);
+                    await withRetry("comment.distinguish", () => comment.distinguish(true));
+                    await withRetry("comment.lock", () => comment.lock());
+                    console.log(`[POST REMOVED] Post ${post.id} removed: Wednesday-only flair ("${post.flair?.text ?? ""}") posted outside Wednesday.`);
                     
                     return; // EXIT EARLY: Don't check GitHub or AI if removed for Wednesday
                 } else {
@@ -101,7 +148,9 @@ Devvit.addSchedulerJob({
             // --- 2. GITHUB REPO AGE CHECK ---
             const urlRepos = getGithubRepos(post.url || "");
             const bodyRepos = getGithubRepos(post.body || "");
-            const allRepos = [...urlRepos, ...bodyRepos];
+            // Also scan the rendered HTML, which contains the link target (href) of every link behind text
+            const htmlRepos = getGithubRepos(post.bodyHtml || "");
+            const allRepos = dedupeRepos([...urlRepos, ...bodyRepos, ...htmlRepos]);
             
             let isTooNew = false;
 
@@ -137,8 +186,8 @@ Devvit.addSchedulerJob({
                         // THIS LOG WILL TELL YOU IF GITHUB IS RATE LIMITING YOU
                         console.error(`[GITHUB API ERROR] Failed to fetch ${repo.owner}/${repo.repo}. Status: ${response.status} ${response.statusText}`);
                         
-                        // If rate limited (403), stop querying to avoid permanent bans
-                        if (response.status === 403) break; 
+                        // If rate limited (403/429), stop querying to avoid permanent bans
+                        if (response.status === 403 || response.status === 429) break;
                     }
                 } catch (apiError) {
                     console.error(`[ERROR] Failed to fetch GitHub API for ${repo.owner}/${repo.repo}:`, apiError);
@@ -147,14 +196,14 @@ Devvit.addSchedulerJob({
 
             // If a repo is less than 3 months old, remove it and exit early
             if (isTooNew) {
-                await post.remove();
+                await withRetry("post.remove", () => post.remove());
                 
                 try {
                     // Add the internal mod note for the removal reason
-                    await post.addRemovalNote({
+                    await withRetry("addRemovalNote", () => post.addRemovalNote({
                         reasonId: "015176e6-83e3-4b30-8258-47fbb4d2ed16", // Removal UUID, retrieved via API, or APP https://developers.reddit.com/apps/removalreasonids
                         modNote: "GitHub project too new (< 3 months) [Asimov's Auditor]"
-                    });
+                    }));
                     console.log(`[MOD NOTE ADDED] for post ${post.id}`);
                 } catch (e) {
                     // Log the error but don't stop the script
@@ -168,8 +217,8 @@ Devvit.addSchedulerJob({
                     text: projectTooNewMsg,
                 });
 
-                await comment.distinguish(true);
-                await comment.lock(); // Lock the comment so users can't reply to it
+                await withRetry("comment.distinguish", () => comment.distinguish(true));
+                await withRetry("comment.lock", () => comment.lock()); // Lock the comment so users can't reply to it
                 console.log(`[COMMENT PINNED & LOCKED] Pinned comment added to post ${post.id}`);
                 
                 return; // IMPORTANT: Exit the job here so we don't proceed to the AI check.
@@ -177,7 +226,7 @@ Devvit.addSchedulerJob({
 
 
             // --- AI QUESTION CHECK (Runs only if GitHub check passes) ---
-            await post.remove();
+            await withRetry("post.remove", () => post.remove());
             console.log(`[POST REMOVED] Post ${post.id} removed pending AI explanation.`);
 
             const comment = await context.reddit.submitComment({
@@ -185,7 +234,7 @@ Devvit.addSchedulerJob({
                 text: aiQuestionAsk,
             });
 
-            await comment.distinguish(true);
+            await withRetry("comment.distinguish", () => comment.distinguish(true));
             console.log(`[COMMENT PINNED] Pinned comment added to post ${post.id}`);
 
         } catch (error) {
@@ -224,38 +273,66 @@ Devvit.addTrigger({
         const commentEvent = event.comment;
         if (!commentEvent) return;
 
+        // Cheap pre-filters using the event payload, so we don't make API calls for every comment in the sub.
+        // Only replies to other comments (parent ID starts with "t1_") can be answers to the bot's question.
+        if (!commentEvent.parentId?.startsWith("t1_")) return;
+        // Only the Original Poster (OP) can answer the question.
+        // (IDs are normalized because the event payload may or may not include the "t2_" prefix.)
+        const stripT2 = (id: string) => id.replace(/^t2_/, "");
+        if (event.author?.id && event.post?.authorId && stripT2(event.author.id) !== stripT2(event.post.authorId)) return;
+
         try {
-            const fullComment = await context.reddit.getCommentById(commentEvent.id);
-            const post = await context.reddit.getPostById(fullComment.postId);
+            const fullComment = await withRetry("getCommentById", () => context.reddit.getCommentById(commentEvent.id));
+            const post = await withRetry("getPostById", () => context.reddit.getPostById(fullComment.postId));
 
             // Check if the person commenting is the Original Poster (OP)
             if (fullComment.authorId === post.authorId) {
-                
+
                 // Check if the OP is replying to a comment (parent ID starts with "t1_")
                 if (fullComment.parentId.startsWith("t1_")) {
-                    const parentComment = await context.reddit.getCommentById(fullComment.parentId);
-                    
+                    const parentComment = await withRetry("getCommentById(parent)", () => context.reddit.getCommentById(fullComment.parentId));
+
                     if (parentComment.body.includes("how AI was used in the creation of your post/project")) {
-                        console.log(`[MATCH FOUND] OP replied to the bot's AI question. Verifying post status...`);
-                        
+                        // SECURITY: Make sure the parent comment was actually written by this bot.
+                        // Otherwise OP could post a comment containing the question text and reply to it to self-approve.
+                        const appUser = await withRetry("getAppUser", () => context.reddit.getAppUser());
+                        const appUsername = appUser.username.toLowerCase();
+                        if (parentComment.authorName.toLowerCase() !== appUsername) {
+                            console.log(`[IGNORED] Comment ${parentComment.id} contains the AI question but was not written by the bot (author: ${parentComment.authorName}).`);
+                            return;
+                        }
+
+                        console.log(`[MATCH FOUND] OP replied (${fullComment.id}) to the bot's AI question on post ${post.id}. Post status: removed=${post.isRemoved()}, spam=${post.isSpam()}, removedBy=${post.removedBy ?? "none"}, category=${post.removedByCategory ?? "none"}, approved=${post.isApproved()}. Reply status: removed=${fullComment.isRemoved()}, spam=${fullComment.isSpam()}.`);
+
+                        // SAFEGUARD: If OP's reply itself was caught by Reddit's spam filters or AutoModerator,
+                        // don't approve anything. Leave the reply and the post removed for manual review.
+                        if (fullComment.isSpam() || fullComment.isRemoved() || commentEvent.spam) {
+                            console.log(`[NOT APPROVED] OP's reply ${fullComment.id} was filtered/removed. Leaving post ${post.id} and the reply for manual review.`);
+                            return;
+                        }
+
                         // SAFEGUARD: Only approve if the removal category is 'moderator' (which includes our bot).
                         // If it is 'reddit' (spam/reputation) or 'automod_filtered', leave it alone.
+                        // Also don't undo a removal made by a human moderator or AutoModerator.
+                        const removedByOtherMod = post.isRemoved() && typeof post.removedBy === "string" && post.removedBy !== "" && post.removedBy.toLowerCase() !== appUsername;
                         if (post.isSpam() || (post.removedByCategory && post.removedByCategory !== 'moderator')) {
-                            console.log(`[NOT APPROVED] Post ${post.id} was caught by Reddit's filters (Category: ${post.removedByCategory}).`);
+                            console.log(`[NOT APPROVED] Post ${post.id} was caught by Reddit's filters (spam: ${post.isSpam()}, Category: ${post.removedByCategory}, removedBy: ${post.removedBy ?? "none"}). Leaving it for manual review.`);
+                        } else if (removedByOtherMod) {
+                            console.log(`[NOT APPROVED] Post ${post.id} was removed by u/${post.removedBy}, not the bot. Leaving it for manual review.`);
                         } else {
                             // Safe to approve
-                            await post.approve();
+                            await withRetry("post.approve", () => post.approve());
                             console.log(`[POST APPROVED] Post ${post.id} successfully approved.`);
                         }
                         
                         // Update and lock the bot's comment
-                        await parentComment.edit({ text: aiQuestionAnswered });
-                        await parentComment.lock();
-                        await parentComment.approve();
+                        await withRetry("botComment.edit", () => parentComment.edit({ text: aiQuestionAnswered }));
+                        await withRetry("botComment.lock", () => parentComment.lock());
+                        await withRetry("botComment.approve", () => parentComment.approve());
                         console.log(`[COMMENT LOCKED] Bot comment updated and locked.`);
 
-                        await fullComment.lock();
-                        await fullComment.approve();
+                        await withRetry("opReply.lock", () => fullComment.lock());
+                        await withRetry("opReply.approve", () => fullComment.approve());
                         console.log(`[OP REPLY LOCKED] OP's reply to the bot was locked.`);
                     }
                 }
