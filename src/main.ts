@@ -17,6 +17,10 @@ const WEDNESDAY_ONLY_FLAIR_IDS = [
     "587d404a-7e68-11e9-bd12-0eb480af1d48", // Personal Dashboard
 ];
 
+// removedByCategory values for posts held by a filter and waiting in the mod queue (not removed by a person):
+// "reddit" = Reddit's spam / reputation filters, "automod_filtered" = AutoModerator `action: filter`
+const FILTER_REMOVAL_CATEGORIES = ["reddit", "automod_filtered"];
+
 // Helper: Check if it is Wednesday ANYWHERE on Earth
 function isWednesdaySomewhere(): boolean {
     const now = new Date();
@@ -101,11 +105,17 @@ Devvit.addSchedulerJob({
                 return; 
             }
 
-            // Leave posts caught by Reddit's spam filters / AutoModerator in the mod queue for manual review.
-            // removedByCategory also covers filtered posts (e.g. "automod_filtered") that may not report isRemoved().
-            if (post.isRemoved() || post.isSpam() || post.removedByCategory) {
-                console.log(`[SKIPPED] Post ${post.id} was already removed or filtered (Category: ${post.removedByCategory ?? "none"}, spam: ${post.isSpam()}). Not interacting.`);
+            // Posts held by Reddit's filters (e.g. reputation/spam filter) or AutoModerator's filter are waiting in the
+            // mod queue. We still run the full routine on them (so OP gets the AI question), but never remove them for
+            // the AI question (a mod removal would take them out of the queue) and never approve them later.
+            // Anything else that is already removed (by a moderator, the author, Reddit admins, ...) is left alone.
+            const isFiltered = FILTER_REMOVAL_CATEGORIES.includes(post.removedByCategory ?? "");
+            if (!isFiltered && (post.isRemoved() || post.isSpam() || post.removedByCategory)) {
+                console.log(`[SKIPPED] Post ${post.id} was already removed (Category: ${post.removedByCategory ?? "none"}, spam: ${post.isSpam()}, removedBy: ${post.removedBy ?? "none"}). Not interacting.`);
                 return;
+            }
+            if (isFiltered) {
+                console.log(`[FILTERED] Post ${post.id} is held by a filter (Category: ${post.removedByCategory}, spam: ${post.isSpam()}). Running checks, but it will stay in the mod queue.`);
             }
 
             // --- 1. WEDNESDAY EXCEPTION CHECK ---
@@ -226,8 +236,13 @@ Devvit.addSchedulerJob({
 
 
             // --- AI QUESTION CHECK (Runs only if GitHub check passes) ---
-            await withRetry("post.remove", () => post.remove());
-            console.log(`[POST REMOVED] Post ${post.id} removed pending AI explanation.`);
+            if (isFiltered) {
+                // Already removed by the filter. Don't remove it again, or it would leave the mod queue.
+                console.log(`[POST KEPT IN QUEUE] Post ${post.id} is filtered (Category: ${post.removedByCategory}); not removing, only asking the AI question.`);
+            } else {
+                await withRetry("post.remove", () => post.remove());
+                console.log(`[POST REMOVED] Post ${post.id} removed pending AI explanation.`);
+            }
 
             const comment = await context.reddit.submitComment({
                 id: post.id,
