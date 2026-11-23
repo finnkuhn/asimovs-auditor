@@ -1,4 +1,4 @@
-import { Devvit } from "@devvit/public-api";
+import { Devvit, type Comment, type Post } from "@devvit/public-api";
 import { Scope } from "@devvit/protos";
 
 Devvit.configure({
@@ -7,8 +7,16 @@ Devvit.configure({
     http: true
 });
 
-const aiQuestionAsk = "Thanks for posting to r/selfhosted. Your post has been temporarily removed. Please reply to this comment explaining how AI was used in the creation of your post/project. Once you reply, your post will be automatically approved. To learn more about why this is required, please see our [pinned post](https://www.reddit.com/r/selfhosted/comments/1sey9ch/quarter_2_update_revisiting_rules_again/).";
+// How long OP has to answer the AI question before the post is removed for good
+const AI_ANSWER_TIMEOUT_HOURS = 3;
+
+// Text that identifies the bot's (unanswered) AI question comment. Must stay part of aiQuestionAsk.
+const AI_QUESTION_MARKER = "how AI was used in the creation of your post/project";
+
+const aiQuestionAsk = `Thanks for posting to r/selfhosted. Your post has been temporarily removed. Please reply to this comment explaining how AI was used in the creation of your post/project. Once you reply, your post will be automatically approved. If you don't reply within ${AI_ANSWER_TIMEOUT_HOURS} hours, your post will be removed. To learn more about why this is required, please see our [pinned post](https://www.reddit.com/r/selfhosted/comments/1sey9ch/quarter_2_update_revisiting_rules_again/).`;
 const aiQuestionAnswered = "Expand the replies to this comment to learn how AI was used in this post/project.";
+const aiQuestionExpired = `This question wasn't answered within ${AI_ANSWER_TIMEOUT_HOURS} hours.`;
+const aiNoAnswerMsg = `Thanks for posting to r/selfhosted. Your post has been removed because you didn't explain how AI was used in the creation of your post/project within ${AI_ANSWER_TIMEOUT_HOURS} hours. You're welcome to post it again as long as it complies with all of our rules. Just make sure to reply to the bot's question when you do. To learn more about why this is required, please see our [pinned post](https://www.reddit.com/r/selfhosted/comments/1sey9ch/quarter_2_update_revisiting_rules_again/).`;
 const projectTooNewMsg = `Thanks for posting to r/selfhosted. Your post has been removed. Please share your project in the [current New Project Megathread](https://www.reddit.com/r/selfhosted/search/?q="New%20Project%20Megathread%20-"&type=posts&sort=new) instead or see rule 6 for more information.`;
 const wednesdayExceptionMsg = `Thanks for posting to r/selfhosted. Your post has been removed. Please check the day of the week and make sure it is Wednesday (see rule 5 for more information).`;
 
@@ -252,8 +260,137 @@ Devvit.addSchedulerJob({
             await withRetry("comment.distinguish", () => comment.distinguish(true));
             console.log(`[COMMENT PINNED] Pinned comment added to post ${post.id}`);
 
+            // Remove the post for good if OP doesn't answer in time
+            try {
+                await context.scheduler.runJob({
+                    name: 'ai_answer_timeout',
+                    data: { postId: post.id, commentId: comment.id },
+                    runAt: new Date(Date.now() + AI_ANSWER_TIMEOUT_HOURS * 60 * 60 * 1000),
+                });
+                console.log(`[TIMEOUT SCHEDULED] Post ${post.id} will be removed in ${AI_ANSWER_TIMEOUT_HOURS}h if OP doesn't answer.`);
+            } catch (e) {
+                console.error(`[ERROR] Failed to schedule ai_answer_timeout for ${post.id}:`, e);
+            }
+
         } catch (error) {
             console.error(`[ERROR] in delayed_post_check:`, error);
+        }
+    }
+});
+
+// Process OP's answer to the bot's AI question: approve the post (unless filtered / removed by someone else),
+// mark the question as answered, and lock both comments. Used by the CommentSubmit trigger and as a fallback
+// by the timeout job (e.g. when processing the reply failed because of a Reddit API error).
+async function handleOpAnswer(
+    post: Post,
+    botComment: Comment,
+    opReply: Comment,
+    appUsername: string,
+    replyFlaggedSpam = false,
+): Promise<void> {
+    console.log(`[MATCH FOUND] OP replied (${opReply.id}) to the bot's AI question on post ${post.id}. Post status: removed=${post.isRemoved()}, spam=${post.isSpam()}, removedBy=${post.removedBy ?? "none"}, category=${post.removedByCategory ?? "none"}, approved=${post.isApproved()}. Reply status: removed=${opReply.isRemoved()}, spam=${opReply.isSpam()}.`);
+
+    // SAFEGUARD: If OP's reply itself was caught by Reddit's spam filters or AutoModerator,
+    // don't approve anything. Leave the reply and the post removed for manual review.
+    if (opReply.isSpam() || opReply.isRemoved() || replyFlaggedSpam) {
+        console.log(`[NOT APPROVED] OP's reply ${opReply.id} was filtered/removed. Leaving post ${post.id} and the reply for manual review.`);
+        return;
+    }
+
+    // SAFEGUARD: Only approve if the removal category is 'moderator' (which includes our bot).
+    // If it is 'reddit' (spam/reputation) or 'automod_filtered', leave it in the mod queue.
+    // Also don't undo a removal made by a human moderator or AutoModerator.
+    const removedByOtherMod = post.isRemoved() && typeof post.removedBy === "string" && post.removedBy !== "" && post.removedBy.toLowerCase() !== appUsername;
+    if (post.isSpam() || (post.removedByCategory && post.removedByCategory !== 'moderator')) {
+        console.log(`[NOT APPROVED] Post ${post.id} was caught by Reddit's filters (spam: ${post.isSpam()}, Category: ${post.removedByCategory}, removedBy: ${post.removedBy ?? "none"}). Leaving it for manual review.`);
+    } else if (removedByOtherMod) {
+        console.log(`[NOT APPROVED] Post ${post.id} was removed by u/${post.removedBy}, not the bot. Leaving it for manual review.`);
+    } else {
+        // Safe to approve
+        await withRetry("post.approve", () => post.approve());
+        console.log(`[POST APPROVED] Post ${post.id} successfully approved.`);
+    }
+
+    // Update and lock the bot's comment
+    await withRetry("botComment.edit", () => botComment.edit({ text: aiQuestionAnswered }));
+    await withRetry("botComment.lock", () => botComment.lock());
+    await withRetry("botComment.approve", () => botComment.approve());
+    console.log(`[COMMENT LOCKED] Bot comment updated and locked.`);
+
+    await withRetry("opReply.lock", () => opReply.lock());
+    await withRetry("opReply.approve", () => opReply.approve());
+    console.log(`[OP REPLY LOCKED] OP's reply to the bot was locked.`);
+}
+
+// Runs AI_ANSWER_TIMEOUT_HOURS after the AI question was asked. Removes the post for good if OP never answered.
+Devvit.addSchedulerJob({
+    name: 'ai_answer_timeout',
+    onRun: async (event, context) => {
+        try {
+            const postId = event.data!.postId as string;
+            const commentId = event.data!.commentId as string;
+            const post = await withRetry("getPostById", () => context.reddit.getPostById(postId));
+            const botComment = await withRetry("getCommentById", () => context.reddit.getCommentById(commentId));
+
+            // Already answered (comment edited to aiQuestionAnswered), expired, or removed by a mod
+            if (!botComment.body.includes(AI_QUESTION_MARKER)) {
+                console.log(`[TIMEOUT] Post ${post.id}: AI question was already handled. Nothing to do.`);
+                return;
+            }
+
+            const appUser = await withRetry("getAppUser", () => context.reddit.getAppUser());
+            const appUsername = appUser.username.toLowerCase();
+
+            // OP replied, but the reply was never processed (e.g. Reddit API error) or is waiting for manual review
+            const replies = await withRetry("botComment.replies", () => botComment.replies.all());
+            const opReply = replies.find(reply => reply.authorId === post.authorId);
+            if (opReply) {
+                console.log(`[TIMEOUT] Post ${post.id}: OP did reply (${opReply.id}) but it wasn't processed yet. Processing it now instead of removing.`);
+                await handleOpAnswer(post, botComment, opReply, appUsername);
+                return;
+            }
+
+            // Leave the post alone if someone else already dealt with it
+            const isFiltered = FILTER_REMOVAL_CATEGORIES.includes(post.removedByCategory ?? "");
+            const removedByOtherMod = post.isRemoved() && !isFiltered && typeof post.removedBy === "string" && post.removedBy !== "" && post.removedBy.toLowerCase() !== appUsername;
+            if (!post.isRemoved() && !post.removedByCategory) {
+                console.log(`[TIMEOUT] Post ${post.id} is no longer removed (approved by a moderator?). Not removing.`);
+                return;
+            }
+            if (post.removedByCategory === "deleted" || post.removedByCategory === "author" || removedByOtherMod) {
+                console.log(`[TIMEOUT] Post ${post.id} was deleted or removed by someone else (Category: ${post.removedByCategory}, removedBy: ${post.removedBy ?? "none"}). Not interacting.`);
+                return;
+            }
+
+            // Filtered posts were never removed by the bot. Remove them now (this also takes them out of the mod queue).
+            if (isFiltered) {
+                await withRetry("post.remove", () => post.remove());
+            }
+
+            try {
+                await withRetry("addRemovalNote", () => post.addRemovalNote({
+                    reasonId: "", // No removal reason configured for this yet
+                    modNote: `No answer to AI question within ${AI_ANSWER_TIMEOUT_HOURS}h [Asimov's Auditor]`
+                }));
+            } catch (e) {
+                console.error(`[MOD NOTE ERROR] Failed to add removal note for ${post.id}:`, e);
+            }
+
+            // Expire the question so a late reply can't approve the post
+            await withRetry("botComment.edit", () => botComment.edit({ text: aiQuestionExpired }));
+            await withRetry("botComment.lock", () => botComment.lock());
+
+            // New comment (instead of an edit) so OP gets notified
+            const comment = await context.reddit.submitComment({
+                id: post.id,
+                text: aiNoAnswerMsg,
+            });
+            await withRetry("comment.distinguish", () => comment.distinguish(true));
+            await withRetry("comment.lock", () => comment.lock());
+
+            console.log(`[POST REMOVED] Post ${post.id} removed: AI question not answered within ${AI_ANSWER_TIMEOUT_HOURS}h.`);
+        } catch (error) {
+            console.error(`[ERROR] in ai_answer_timeout:`, error);
         }
     }
 });
@@ -307,7 +444,7 @@ Devvit.addTrigger({
                 if (fullComment.parentId.startsWith("t1_")) {
                     const parentComment = await withRetry("getCommentById(parent)", () => context.reddit.getCommentById(fullComment.parentId));
 
-                    if (parentComment.body.includes("how AI was used in the creation of your post/project")) {
+                    if (parentComment.body.includes(AI_QUESTION_MARKER)) {
                         // SECURITY: Make sure the parent comment was actually written by this bot.
                         // Otherwise OP could post a comment containing the question text and reply to it to self-approve.
                         const appUser = await withRetry("getAppUser", () => context.reddit.getAppUser());
@@ -317,38 +454,7 @@ Devvit.addTrigger({
                             return;
                         }
 
-                        console.log(`[MATCH FOUND] OP replied (${fullComment.id}) to the bot's AI question on post ${post.id}. Post status: removed=${post.isRemoved()}, spam=${post.isSpam()}, removedBy=${post.removedBy ?? "none"}, category=${post.removedByCategory ?? "none"}, approved=${post.isApproved()}. Reply status: removed=${fullComment.isRemoved()}, spam=${fullComment.isSpam()}.`);
-
-                        // SAFEGUARD: If OP's reply itself was caught by Reddit's spam filters or AutoModerator,
-                        // don't approve anything. Leave the reply and the post removed for manual review.
-                        if (fullComment.isSpam() || fullComment.isRemoved() || commentEvent.spam) {
-                            console.log(`[NOT APPROVED] OP's reply ${fullComment.id} was filtered/removed. Leaving post ${post.id} and the reply for manual review.`);
-                            return;
-                        }
-
-                        // SAFEGUARD: Only approve if the removal category is 'moderator' (which includes our bot).
-                        // If it is 'reddit' (spam/reputation) or 'automod_filtered', leave it alone.
-                        // Also don't undo a removal made by a human moderator or AutoModerator.
-                        const removedByOtherMod = post.isRemoved() && typeof post.removedBy === "string" && post.removedBy !== "" && post.removedBy.toLowerCase() !== appUsername;
-                        if (post.isSpam() || (post.removedByCategory && post.removedByCategory !== 'moderator')) {
-                            console.log(`[NOT APPROVED] Post ${post.id} was caught by Reddit's filters (spam: ${post.isSpam()}, Category: ${post.removedByCategory}, removedBy: ${post.removedBy ?? "none"}). Leaving it for manual review.`);
-                        } else if (removedByOtherMod) {
-                            console.log(`[NOT APPROVED] Post ${post.id} was removed by u/${post.removedBy}, not the bot. Leaving it for manual review.`);
-                        } else {
-                            // Safe to approve
-                            await withRetry("post.approve", () => post.approve());
-                            console.log(`[POST APPROVED] Post ${post.id} successfully approved.`);
-                        }
-                        
-                        // Update and lock the bot's comment
-                        await withRetry("botComment.edit", () => parentComment.edit({ text: aiQuestionAnswered }));
-                        await withRetry("botComment.lock", () => parentComment.lock());
-                        await withRetry("botComment.approve", () => parentComment.approve());
-                        console.log(`[COMMENT LOCKED] Bot comment updated and locked.`);
-
-                        await withRetry("opReply.lock", () => fullComment.lock());
-                        await withRetry("opReply.approve", () => fullComment.approve());
-                        console.log(`[OP REPLY LOCKED] OP's reply to the bot was locked.`);
+                        await handleOpAnswer(post, parentComment, fullComment, appUsername, commentEvent.spam);
                     }
                 }
             }
