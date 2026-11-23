@@ -379,6 +379,8 @@ Devvit.addSchedulerJob({
             // Expire the question so a late reply can't approve the post
             await withRetry("botComment.edit", () => botComment.edit({ text: aiQuestionExpired }));
             await withRetry("botComment.lock", () => botComment.lock());
+            // Approve so the edited comment doesn't show up in (or is cleared from) the mod queue
+            await withRetry("botComment.approve", () => botComment.approve());
 
             // New comment (instead of an edit) so OP gets notified
             const comment = await context.reddit.submitComment({
@@ -387,6 +389,7 @@ Devvit.addSchedulerJob({
             });
             await withRetry("comment.distinguish", () => comment.distinguish(true));
             await withRetry("comment.lock", () => comment.lock());
+            await withRetry("comment.approve", () => comment.approve()); // Keep it out of the mod queue
 
             console.log(`[POST REMOVED] Post ${post.id} removed: AI question not answered within ${AI_ANSWER_TIMEOUT_HOURS}h.`);
         } catch (error) {
