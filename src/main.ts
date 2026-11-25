@@ -1,5 +1,6 @@
 import { Devvit, type Comment, type Post } from "@devvit/public-api";
 import { Scope } from "@devvit/protos";
+import { detectUnrenderedMarkdown, isUnrenderedMarkdown } from "./lowEffort";
 
 Devvit.configure({
     redditAPI: true,
@@ -18,7 +19,8 @@ const aiQuestionAnswered = "Expand the replies to this comment to learn how AI w
 const aiQuestionExpired = `This question wasn't answered within ${AI_ANSWER_TIMEOUT_HOURS} hours.`;
 const aiNoAnswerMsg = `Thanks for posting to r/selfhosted. Your post has been removed because you didn't explain how AI was used in the creation of your post/project within ${AI_ANSWER_TIMEOUT_HOURS} hours. You're welcome to post it again as long as it complies with all of our rules. Just make sure to reply to the bot's question when you do. To learn more about why this is required, please see our [pinned post](https://www.reddit.com/r/selfhosted/comments/1sey9ch/quarter_2_update_revisiting_rules_again/).`;
 const projectTooNewMsg = `Thanks for posting to r/selfhosted. Your post has been removed. Please share your project in the [current New Project Megathread](https://www.reddit.com/r/selfhosted/search/?q="New%20Project%20Megathread%20-"&type=posts&sort=new) instead or see rule 6 for more information.`;
-const wednesdayExceptionMsg = `Thanks for posting to r/selfhosted. Your post has been removed. Please check the day of the week and make sure it is Wednesday (see rule 5 for more information).`;
+const lowEffortFormattingMsg = `Thanks for posting to r/selfhosted. Your post has been removed as low effort. It contains markdown that wasn't rendered (for example \`**text**\` or \`## headings\` showing up as literal asterisks and hashes), which usually means AI-generated text was pasted in without review. You're welcome to post again if you write the post yourself and it complies with all of our rules.`;
+const wednesdayExceptionMsg =`Thanks for posting to r/selfhosted. Your post has been removed. Please check the day of the week and make sure it is Wednesday (see rule 5 for more information).`;
 
 // Post flair template IDs that are only allowed on Wednesdays (in addition to any flair containing "Wednesday Exception")
 const WEDNESDAY_ONLY_FLAIR_IDS = [
@@ -163,7 +165,34 @@ Devvit.addSchedulerJob({
                 }
             }
 
-            // --- 2. GITHUB REPO AGE CHECK ---
+            // --- 2. LOW EFFORT CHECK: AI-formatted text with unrendered markdown (literal **bold** / ## headings) ---
+            const markdown = detectUnrenderedMarkdown(post.body, post.bodyHtml);
+            if (isUnrenderedMarkdown(markdown)) {
+                await withRetry("post.remove", () => post.remove());
+
+                try {
+                    await withRetry("addRemovalNote", () => post.addRemovalNote({
+                        reasonId: "736f99f9-fcef-49b3-8078-ef9ab306c34f", // Low effort
+                        modNote: `Unrendered markdown (${markdown.bold}x **, ${markdown.headings}x #) [Asimov's Auditor]`
+                    }));
+                    console.log(`[MOD NOTE ADDED] for post ${post.id}`);
+                } catch (e) {
+                    console.error(`[MOD NOTE ERROR] Failed to add removal note for ${post.id}:`, e);
+                }
+
+                const comment = await context.reddit.submitComment({
+                    id: post.id,
+                    text: lowEffortFormattingMsg,
+                });
+
+                await withRetry("comment.distinguish", () => comment.distinguish(true));
+                await withRetry("comment.lock", () => comment.lock());
+                console.log(`[POST REMOVED] Post ${post.id} removed: low effort, unrendered markdown (bold: ${markdown.bold}, headings: ${markdown.headings}).`);
+
+                return; // EXIT EARLY: Don't check GitHub or AI
+            }
+
+            // --- 3. GITHUB REPO AGE CHECK ---
             const urlRepos = getGithubRepos(post.url || "");
             const bodyRepos = getGithubRepos(post.body || "");
             // Also scan the rendered HTML, which contains the link target (href) of every link behind text
