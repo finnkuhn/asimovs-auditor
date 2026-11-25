@@ -1,4 +1,4 @@
-import { Devvit, type Comment, type Post } from "@devvit/public-api";
+import { Devvit, type Comment, type Post, type RedditAPIClient } from "@devvit/public-api";
 import { Scope } from "@devvit/protos";
 import { detectUnrenderedMarkdown, isUnrenderedMarkdown } from "./lowEffort";
 
@@ -18,9 +18,20 @@ const aiQuestionAsk = `Thanks for posting to r/selfhosted. Your post has been te
 const aiQuestionAnswered = "Expand the replies to this comment to learn how AI was used in this post/project.";
 const aiQuestionExpired = `This question wasn't answered within ${AI_ANSWER_TIMEOUT_HOURS} hours.`;
 const aiNoAnswerMsg = `Thanks for posting to r/selfhosted. Your post has been removed because you didn't explain how AI was used in the creation of your post/project within ${AI_ANSWER_TIMEOUT_HOURS} hours. You're welcome to post it again as long as it complies with all of our rules. Just make sure to reply to the bot's question when you do. To learn more about why this is required, please see our [pinned post](https://www.reddit.com/r/selfhosted/comments/1sey9ch/quarter_2_update_revisiting_rules_again/).`;
-const projectTooNewMsg = `Thanks for posting to r/selfhosted. Your post has been removed. Please share your project in the [current New Project Megathread](https://www.reddit.com/r/selfhosted/search/?q="New%20Project%20Megathread%20-"&type=posts&sort=new) instead or see rule 6 for more information.`;
-const lowEffortFormattingMsg = `Thanks for posting to r/selfhosted. Your post has been removed as low effort. It contains markdown that wasn't rendered (for example \`**text**\` or \`## headings\` showing up as literal asterisks and hashes), which usually means AI-generated text was pasted in without review. You're welcome to post again if you write the post yourself and it complies with all of our rules.`;
-const wednesdayExceptionMsg =`Thanks for posting to r/selfhosted. Your post has been removed. Please check the day of the week and make sure it is Wednesday (see rule 5 for more information).`;
+// Text that identifies the bot's "waiting for manual review" notice. Must stay part of reviewPendingMsg.
+const REVIEW_PENDING_MARKER = "will be reviewed by a moderator in due course";
+const reviewPendingMsg = `Thanks for your reply! Your post (or your reply) was caught by Reddit's filters, so it can't be approved automatically. It is now in the mod queue and ${REVIEW_PENDING_MARKER}. This can take a while, so please don't repost it in the meantime. This comment will be removed once your post has been approved.`;
+const projectTooNewMsg =`Thanks for posting to r/selfhosted. Your post has been removed. Please share your project in the [current New Project Megathread](https://www.reddit.com/r/selfhosted/search/?q="New%20Project%20Megathread%20-"&type=posts&sort=new) instead or see rule 6 for more information.`;
+const lowEffortFormattingMsg = `Thanks for posting to r/selfhosted. Your post has been removed as low effort because its formatting is broken: it contains Markdown that wasn't rendered, so things like \`**bold**\` or \`## Heading\` show up as literal asterisks and hashes. This usually happens when AI-generated text is pasted into the default Rich Text editor.
+
+You're welcome to post it again (as long as it complies with all of our rules) after fixing the formatting. Either:
+
+* click **Markdown Editor** when creating your post and paste your text there, so the Markdown is rendered, or
+* stay in the Rich Text editor, remove the \`*\` and \`#\` characters, and use the editor's formatting buttons instead.
+
+Please check the preview before posting. See Reddit's [Formatting Guide](https://support.reddithelp.com/hc/en-us/articles/360043033952-Formatting-Guide) for more information.`;
+const wednesdayExceptionMsg = `Thanks for posting to r/selfhosted. Your post has been removed. Please check the day of the week and make sure it is Wednesday (see rule 5 for more information).`;
+const appStoreLinkMsg = `Thanks for posting to r/selfhosted. Your post has been removed because it links to an app store (App Store / Google Play). Posts like this are only allowed on Wednesdays, so please post it again on a Wednesday (see rule 5 for more information).`;
 
 // Post flair template IDs that are only allowed on Wednesdays (in addition to any flair containing "Wednesday Exception")
 const WEDNESDAY_ONLY_FLAIR_IDS = [
@@ -70,6 +81,13 @@ function getGithubRepos(text: string): { owner: string, repo: string }[] {
     });
 
     return repos;
+}
+
+// Helper: Does the text contain a link to the Apple App Store / TestFlight or Google Play?
+function hasAppStoreLink(text: string): boolean {
+    if (!text) return false;
+    text = text.replace(/\\([^a-zA-Z0-9\s])/g, "$1"); // Undo markdown escaping (see getGithubRepos)
+    return /(?<![a-z0-9.-])(?:https?:\/\/)?(?:(?:apps|itunes|testflight)\.apple\.com\/|play\.google\.com\/store\/apps)/i.test(text);
 }
 
 // Deduplicate repos (GitHub names are case-insensitive) so the API isn't hit twice for the same repo
@@ -129,20 +147,23 @@ Devvit.addSchedulerJob({
             }
 
             // --- 1. WEDNESDAY EXCEPTION CHECK ---
-            // Applies to posts with the "Wednesday Exception" or "Personal Dashboard" flair
+            // Applies to posts with the "Wednesday Exception" or "Personal Dashboard" flair,
+            // and to posts linking to the Apple App Store / Google Play
             const flairText = post.flair?.text?.toLowerCase() || "";
             const flairTemplateId = post.flair?.templateId || "";
             const isWednesdayOnlyFlair =
                 flairText.includes("wednesday exception") ||
                 WEDNESDAY_ONLY_FLAIR_IDS.includes(flairTemplateId);
-            if (isWednesdayOnlyFlair) {
+            const appStoreLink = [post.url ?? "", post.body ?? "", post.bodyHtml ?? ""].some(hasAppStoreLink);
+            if (isWednesdayOnlyFlair || appStoreLink) {
+                const reason = isWednesdayOnlyFlair ? `Wednesday-only flair ("${post.flair?.text ?? ""}")` : "app store link";
                 if (!isWednesdaySomewhere()) {
                     await withRetry("post.remove", () => post.remove());
                     
                     try {
                         await withRetry("addRemovalNote", () => post.addRemovalNote({
                             reasonId: "b82f1872-23b1-468e-8b5d-d2514110fcc2", // Removal UUID, retrieved via API, or APP https://developers.reddit.com/apps/removalreasonids
-                            modNote: "Not Wednesday anywhere [Asimov's Auditor]"
+                            modNote: `Not Wednesday anywhere, ${reason} [Asimov's Auditor]`
                         }));
                         console.log(`[MOD NOTE ADDED] for post ${post.id}`);
                     } catch (e) {
@@ -152,12 +173,12 @@ Devvit.addSchedulerJob({
 
                     const comment = await context.reddit.submitComment({
                         id: post.id,
-                        text: wednesdayExceptionMsg,
+                        text: isWednesdayOnlyFlair ? wednesdayExceptionMsg : appStoreLinkMsg,
                     });
 
                     await withRetry("comment.distinguish", () => comment.distinguish(true));
                     await withRetry("comment.lock", () => comment.lock());
-                    console.log(`[POST REMOVED] Post ${post.id} removed: Wednesday-only flair ("${post.flair?.text ?? ""}") posted outside Wednesday.`);
+                    console.log(`[POST REMOVED] Post ${post.id} removed: ${reason} posted outside Wednesday.`);
                     
                     return; // EXIT EARLY: Don't check GitHub or AI if removed for Wednesday
                 } else {
@@ -307,10 +328,35 @@ Devvit.addSchedulerJob({
     }
 });
 
+// The bot's top-level comments on a post that contain the given marker text
+async function findBotComments(reddit: RedditAPIClient, postId: string, appUsername: string, marker: string): Promise<Comment[]> {
+    const comments = await withRetry("getComments", () => reddit.getComments({ postId: postId as `t3_${string}`, limit: 100, sort: "old" }).all());
+    return comments.filter(c =>
+        c.parentId.startsWith("t3_") &&
+        c.authorName.toLowerCase() === appUsername &&
+        c.body.includes(marker));
+}
+
+// Tell OP that the post is waiting in the mod queue (posted once per post). Deleted again by the
+// ModAction trigger as soon as the post gets approved.
+async function postReviewPendingNotice(reddit: RedditAPIClient, post: Post, appUsername: string): Promise<void> {
+    try {
+        if ((await findBotComments(reddit, post.id, appUsername, REVIEW_PENDING_MARKER)).length > 0) return;
+        const notice = await reddit.submitComment({ id: post.id, text: reviewPendingMsg });
+        await withRetry("notice.distinguish", () => notice.distinguish(false));
+        await withRetry("notice.lock", () => notice.lock());
+        await withRetry("notice.approve", () => notice.approve()); // Keep it out of the mod queue
+        console.log(`[REVIEW NOTICE] Told OP that post ${post.id} is waiting for manual review.`);
+    } catch (e) {
+        console.error(`[ERROR] Failed to post the review notice on ${post.id}:`, e);
+    }
+}
+
 // Process OP's answer to the bot's AI question: approve the post (unless filtered / removed by someone else),
 // mark the question as answered, and lock both comments. Used by the CommentSubmit trigger and as a fallback
 // by the timeout job (e.g. when processing the reply failed because of a Reddit API error).
 async function handleOpAnswer(
+    reddit: RedditAPIClient,
     post: Post,
     botComment: Comment,
     opReply: Comment,
@@ -323,6 +369,7 @@ async function handleOpAnswer(
     // don't approve anything. Leave the reply and the post removed for manual review.
     if (opReply.isSpam() || opReply.isRemoved() || replyFlaggedSpam) {
         console.log(`[NOT APPROVED] OP's reply ${opReply.id} was filtered/removed. Leaving post ${post.id} and the reply for manual review.`);
+        await postReviewPendingNotice(reddit, post, appUsername);
         return;
     }
 
@@ -332,6 +379,7 @@ async function handleOpAnswer(
     const removedByOtherMod = post.isRemoved() && typeof post.removedBy === "string" && post.removedBy !== "" && post.removedBy.toLowerCase() !== appUsername;
     if (post.isSpam() || (post.removedByCategory && post.removedByCategory !== 'moderator')) {
         console.log(`[NOT APPROVED] Post ${post.id} was caught by Reddit's filters (spam: ${post.isSpam()}, Category: ${post.removedByCategory}, removedBy: ${post.removedBy ?? "none"}). Leaving it for manual review.`);
+        await postReviewPendingNotice(reddit, post, appUsername);
     } else if (removedByOtherMod) {
         console.log(`[NOT APPROVED] Post ${post.id} was removed by u/${post.removedBy}, not the bot. Leaving it for manual review.`);
     } else {
@@ -375,7 +423,7 @@ Devvit.addSchedulerJob({
             const opReply = replies.find(reply => reply.authorId === post.authorId);
             if (opReply) {
                 console.log(`[TIMEOUT] Post ${post.id}: OP did reply (${opReply.id}) but it wasn't processed yet. Processing it now instead of removing.`);
-                await handleOpAnswer(post, botComment, opReply, appUsername);
+                await handleOpAnswer(context.reddit, post, botComment, opReply, appUsername);
                 return;
             }
 
@@ -486,12 +534,33 @@ Devvit.addTrigger({
                             return;
                         }
 
-                        await handleOpAnswer(post, parentComment, fullComment, appUsername, commentEvent.spam);
+                        await handleOpAnswer(context.reddit, post, parentComment, fullComment, appUsername, commentEvent.spam);
                     }
                 }
             }
         } catch (error) {
             console.error(`[ERROR] Failed to process CommentSubmit for ${commentEvent.id}:`, error);
+        }
+    }
+});
+
+// 4. TRIGGER: When a post gets approved, delete the bot's "waiting for manual review" notice
+Devvit.addTrigger({
+    event: "ModAction",
+    async onEvent(event, context) {
+        if (event.action !== "approvelink") return;
+        const postId = event.targetPost?.id;
+        if (!postId) return;
+
+        try {
+            const appUser = await withRetry("getAppUser", () => context.reddit.getAppUser());
+            const notices = await findBotComments(context.reddit, postId, appUser.username.toLowerCase(), REVIEW_PENDING_MARKER);
+            for (const notice of notices) {
+                await withRetry("notice.delete", () => notice.delete());
+                console.log(`[REVIEW NOTICE REMOVED] Post ${postId} was approved by u/${event.moderator?.name ?? "unknown"}; deleted notice ${notice.id}.`);
+            }
+        } catch (error) {
+            console.error(`[ERROR] Failed to process ModAction for ${postId}:`, error);
         }
     }
 });
