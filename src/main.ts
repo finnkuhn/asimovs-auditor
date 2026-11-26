@@ -17,6 +17,7 @@ const AI_QUESTION_MARKER = "how AI was used in the creation of your post/project
 const aiQuestionAsk = `Thanks for posting to r/selfhosted. Your post has been temporarily removed. Please reply to this comment explaining how AI was used in the creation of your post/project. Once you reply, your post will be automatically approved. If you don't reply within ${AI_ANSWER_TIMEOUT_HOURS} hours, your post will be removed. To learn more about why this is required, please see our [pinned post](https://www.reddit.com/r/selfhosted/comments/1sey9ch/quarter_2_update_revisiting_rules_again/).`;
 const aiQuestionAnswered = "Expand the replies to this comment to learn how AI was used in this post/project.";
 const aiQuestionExpired = `This question wasn't answered within ${AI_ANSWER_TIMEOUT_HOURS} hours.`;
+const aiQuestionWithdrawn = "This question no longer applies because the post was removed for breaking a rule.";
 const aiNoAnswerMsg = `Thanks for posting to r/selfhosted. Your post has been removed because you didn't explain how AI was used in the creation of your post/project within ${AI_ANSWER_TIMEOUT_HOURS} hours. You're welcome to post it again as long as it complies with all of our rules. Just make sure to reply to the bot's question when you do. To learn more about why this is required, please see our [pinned post](https://www.reddit.com/r/selfhosted/comments/1sey9ch/quarter_2_update_revisiting_rules_again/).`;
 // Text that identifies the bot's "waiting for manual review" notice. Must stay part of reviewPendingMsg.
 const REVIEW_PENDING_MARKER = "will be reviewed by a moderator in due course";
@@ -55,47 +56,67 @@ function isWednesdaySomewhere(): boolean {
     return false;
 }
 
-// Helper function to extract GitHub owner and repo from text
-function getGithubRepos(text: string): { owner: string, repo: string }[] {
+// Code hosts whose repo age is checked. `path` is "owner/repo" (GitLab may also have subgroups: "group/sub/repo").
+type RepoHost = "GitHub" | "GitLab" | "Codeberg";
+interface RepoRef { host: RepoHost, path: string }
+
+// First path segments that are site pages, not users/groups (e.g. "github.com/orgs/foo", "gitlab.com/explore/projects")
+const RESERVED_OWNERS = new Set(["orgs", "users", "user", "explore", "topics", "marketplace", "settings", "sponsors",
+    "features", "apps", "collections", "search", "dashboard", "groups", "help", "api", "-", "login", "about", "notifications"]);
+
+const REPO_HOST_PATTERNS: { host: RepoHost, regex: RegExp }[] = [
+    // Made https:// optional so it catches "github.com/owner/repo".
+    // The lookbehind stops subdomains like "gist.github.com" from matching.
+    // Repo names may contain dots (e.g. "owner/my.app"), so they are allowed here.
+    { host: "GitHub", regex: /(?<![a-z0-9.-])(?:https?:\/\/)?(?:www\.)?github\.com\/([a-z0-9_-]+\/[a-z0-9_.-]+)/gi },
+    // GitLab projects can be nested in subgroups; anything after "/-/" (files, issues, ...) is cut off below
+    { host: "GitLab", regex: /(?<![a-z0-9.-])(?:https?:\/\/)?(?:www\.)?gitlab\.com\/([a-z0-9_.-]+(?:\/[a-z0-9_.-]+)+)/gi },
+    { host: "Codeberg", regex: /(?<![a-z0-9.-])(?:https?:\/\/)?(?:www\.)?codeberg\.org\/([a-z0-9_.-]+\/[a-z0-9_.-]+)/gi },
+];
+
+// Helper function to extract GitHub / GitLab / Codeberg repos from text
+function getRepos(text: string): RepoRef[] {
     if (!text) return [];
 
     // Undo markdown escaping. Reddit's rich-text editor stores links behind text as
     // "[text](https://github.com/foo\_bar/baz)", which would otherwise break the match.
     text = text.replace(/\\([^a-zA-Z0-9\s])/g, "$1");
 
-    // Made https:// optional so it catches "github.com/owner/repo".
-    // The lookbehind stops subdomains like "gist.github.com" from matching.
-    // Repo names may contain dots (e.g. "owner/my.app"), so they are allowed here.
-    const regex = /(?<![a-z0-9.-])(?:https?:\/\/)?(?:www\.)?github\.com\/([a-z0-9_-]+)\/([a-z0-9_.-]+)/gi;
-    const matches = [...text.matchAll(regex)];
-
-    const repos: { owner: string, repo: string }[] = [];
-
-    matches.forEach(match => {
-        const owner = match[1];
-        // Remove trailing dots (end of a sentence) and ".git" extensions
-        const repo = match[2].replace(/\.+$/, "").replace(/\.git$/i, "");
-        if (repo && repo !== "." && repo !== "..") {
-            repos.push({ owner, repo });
+    const repos: RepoRef[] = [];
+    for (const { host, regex } of REPO_HOST_PATTERNS) {
+        for (const match of text.matchAll(regex)) {
+            let segments = match[1].split("/");
+            if (host === "GitLab") {
+                // Cut at "/-/" and at old-style page paths without it (".../project/tree/main", ".../project/issues/1")
+                const cut = segments.findIndex((seg, i) => i >= 2 && ["-", "tree", "blob", "issues", "merge_requests", "wikis", "commits", "releases", "raw"].includes(seg));
+                if (cut !== -1) segments = segments.slice(0, cut);
+            }
+            // Remove trailing dots (end of a sentence) and ".git" extensions
+            segments[segments.length - 1] = (segments[segments.length - 1] ?? "").replace(/\.+$/, "").replace(/\.git$/i, "");
+            segments = segments.filter(seg => seg !== "");
+            if (segments.length < 2 || RESERVED_OWNERS.has(segments[0].toLowerCase())) continue;
+            if (segments.some(seg => seg === "." || seg === "..")) continue;
+            repos.push({ host, path: segments.join("/") });
         }
-    });
-
+    }
     return repos;
 }
 
 // Helper: Does the text contain a link to the Apple App Store / TestFlight or Google Play?
 function hasAppStoreLink(text: string): boolean {
     if (!text) return false;
-    text = text.replace(/\\([^a-zA-Z0-9\s])/g, "$1"); // Undo markdown escaping (see getGithubRepos)
+    text = text.replace(/\\([^a-zA-Z0-9\s])/g, "$1"); // Undo markdown escaping (see getRepos)
     return /(?<![a-z0-9.-])(?:https?:\/\/)?(?:(?:apps|itunes|testflight)\.apple\.com\/|play\.google\.com\/store\/apps)/i.test(text);
 }
 
-// Deduplicate repos (GitHub names are case-insensitive) so the API isn't hit twice for the same repo
-function dedupeRepos(repos: { owner: string, repo: string }[]): { owner: string, repo: string }[] {
-    const uniqueRepos = new Map<string, { owner: string, repo: string }>();
+// Deduplicate repos (names are case-insensitive) so an API isn't hit twice for the same repo
+function repoKey(r: RepoRef): string {
+    return `${r.host}:${r.path}`.toLowerCase();
+}
+function dedupeRepos(repos: RepoRef[]): RepoRef[] {
+    const uniqueRepos = new Map<string, RepoRef>();
     for (const r of repos) {
-        const key = `${r.owner}/${r.repo}`.toLowerCase();
-        if (!uniqueRepos.has(key)) uniqueRepos.set(key, r);
+        if (!uniqueRepos.has(repoKey(r))) uniqueRepos.set(repoKey(r), r);
     }
     return Array.from(uniqueRepos.values());
 }
@@ -117,6 +138,156 @@ async function withRetry<T>(label: string, fn: () => Promise<T>, attempts = 3): 
             await new Promise(resolve => setTimeout(resolve, delayMs));
         }
     }
+}
+
+// API URL that returns the repo's metadata (all three include "created_at")
+function repoApiUrl(repo: RepoRef): string {
+    switch (repo.host) {
+        case "GitHub": return `https://api.github.com/repos/${repo.path}`;
+        case "GitLab": return `https://gitlab.com/api/v4/projects/${encodeURIComponent(repo.path)}`;
+        case "Codeberg": return `https://codeberg.org/api/v1/repos/${repo.path}`;
+    }
+}
+
+// Is the repo younger than 3 months? Returns "rate_limited" when the host stops answering.
+async function isRepoTooNew(repo: RepoRef): Promise<boolean | "rate_limited"> {
+    const name = `${repo.host} repo ${repo.path}`;
+    try {
+        const response = await fetch(repoApiUrl(repo), {
+            headers: {
+                'User-Agent': 'Devvit-Selfhosted-Bot',
+                'Accept': repo.host === "GitHub" ? 'application/vnd.github.v3+json' : 'application/json'
+            }
+        });
+
+        if (response.ok) {
+            const data = await response.json();
+            if (data.created_at) {
+                const createdAt = new Date(data.created_at);
+                const threeMonthsAgo = new Date();
+                threeMonthsAgo.setMonth(threeMonthsAgo.getMonth() - 3);
+
+                if (createdAt > threeMonthsAgo) {
+                    console.log(`[REPO CHECK] ${name} is too new (${data.created_at}).`);
+                    return true;
+                }
+                console.log(`[REPO CHECK] ${name} is old enough.`);
+            }
+        } else {
+            // THIS LOG WILL TELL YOU IF THE HOST IS RATE LIMITING YOU
+            console.error(`[REPO API ERROR] Failed to fetch ${name}. Status: ${response.status} ${response.statusText}`);
+            // If rate limited (403/429), stop querying this host to avoid permanent bans
+            if (response.status === 403 || response.status === 429) return "rate_limited";
+        }
+    } catch (apiError) {
+        console.error(`[ERROR] Failed to fetch API for ${name}:`, apiError);
+    }
+    return false;
+}
+
+// Remove a post for breaking a rule: removal reason + mod note, and a distinguished, locked comment explaining why
+async function removeForRule(
+    reddit: RedditAPIClient,
+    post: Post,
+    rule: { reasonId: string, modNote: string, message: string, log: string },
+): Promise<void> {
+    await withRetry("post.remove", () => post.remove());
+
+    try {
+        await withRetry("addRemovalNote", () => post.addRemovalNote({
+            reasonId: rule.reasonId, // Removal UUID, retrieved via API, or APP https://developers.reddit.com/apps/removalreasonids
+            modNote: `${rule.modNote} [Asimov's Auditor]`
+        }));
+        console.log(`[MOD NOTE ADDED] for post ${post.id}`);
+    } catch (e) {
+        // Log the error but don't stop the script
+        console.error(`[MOD NOTE ERROR] Failed to add removal note for ${post.id}:`, e);
+    }
+
+    const comment = await reddit.submitComment({ id: post.id, text: rule.message });
+    await withRetry("comment.distinguish", () => comment.distinguish(true));
+    await withRetry("comment.lock", () => comment.lock()); // Lock the comment so users can't reply to it
+    await withRetry("comment.approve", () => comment.approve()); // Keep it out of the mod queue
+    console.log(`[POST REMOVED] Post ${post.id} removed: ${rule.log}`);
+}
+
+// The rule checks (Wednesday-only content, broken AI formatting, too-new GitHub/GitLab/Codeberg repo). Removes the post and returns
+// true if one of them fails. When `previousBody` is given (the post was edited), only content that is new in the
+// edit is checked, so a moderator's earlier approval of the existing content isn't undone.
+async function runRuleChecks(reddit: RedditAPIClient, post: Post, previousBody?: string): Promise<boolean> {
+    const isEdit = previousBody !== undefined;
+    const body = post.body ?? "";
+    const bodyHtml = post.bodyHtml ?? "";
+
+    // --- 1. WEDNESDAY EXCEPTION CHECK ---
+    // Applies to posts with the "Wednesday Exception" or "Personal Dashboard" flair,
+    // and to posts linking to the Apple App Store / Google Play
+    const flairText = post.flair?.text?.toLowerCase() || "";
+    const flairTemplateId = post.flair?.templateId || "";
+    const isWednesdayOnlyFlair = !isEdit && (
+        flairText.includes("wednesday exception") ||
+        WEDNESDAY_ONLY_FLAIR_IDS.includes(flairTemplateId));
+    const appStoreLink = [post.url ?? "", body, bodyHtml].some(hasAppStoreLink) && !(isEdit && hasAppStoreLink(previousBody));
+
+    // --- 3. GITHUB / GITLAB / CODEBERG REPOS (collected here so they can be logged) ---
+    // Also scan the rendered HTML, which contains the link target (href) of every link behind text
+    const oldRepoKeys = new Set(getRepos(previousBody ?? "").map(repoKey));
+    const allRepos = dedupeRepos([...getRepos(post.url || ""), ...getRepos(body), ...getRepos(bodyHtml)])
+        .filter(r => !oldRepoKeys.has(repoKey(r)));
+
+    console.log(`[CHECK] Post ${post.id}${isEdit ? " (edited)" : ""}: body ${body.length} chars, ${allRepos.length} ${isEdit ? "new " : ""}repo(s) [${allRepos.map(r => `${r.host}:${r.path}`).join(", ")}], app store link: ${appStoreLink}, flair: "${post.flair?.text ?? ""}".`);
+
+    if (isWednesdayOnlyFlair || appStoreLink) {
+        if (!isWednesdaySomewhere()) {
+            const reason = isWednesdayOnlyFlair ? `Wednesday-only flair ("${post.flair?.text ?? ""}")` : "app store link";
+            await removeForRule(reddit, post, {
+                reasonId: "b82f1872-23b1-468e-8b5d-d2514110fcc2",
+                modNote: `Not Wednesday anywhere, ${reason}${isEdit ? " (added in edit)" : ""}`,
+                message: isWednesdayOnlyFlair ? wednesdayExceptionMsg : appStoreLinkMsg,
+                log: `${reason} posted outside Wednesday${isEdit ? " (added in edit)" : ""}.`,
+            });
+            return true;
+        }
+        console.log(`[WEDNESDAY CHECK] Passed. It is Wednesday somewhere.`);
+    }
+
+    // --- 2. LOW EFFORT CHECK: AI-formatted text with unrendered markdown (literal **bold** / ## headings) ---
+    const markdown = detectUnrenderedMarkdown(body, bodyHtml);
+    const wasAlreadyBroken = isEdit && isUnrenderedMarkdown(detectUnrenderedMarkdown(previousBody, undefined));
+    if (isUnrenderedMarkdown(markdown) && !wasAlreadyBroken) {
+        await removeForRule(reddit, post, {
+            reasonId: "736f99f9-fcef-49b3-8078-ef9ab306c34f", // Low effort
+            modNote: `Unrendered markdown (${markdown.bold}x **, ${markdown.headings}x #)${isEdit ? " after edit" : ""}`,
+            message: lowEffortFormattingMsg,
+            log: `low effort, unrendered markdown (bold: ${markdown.bold}, headings: ${markdown.headings})${isEdit ? " after edit" : ""}.`,
+        });
+        return true;
+    }
+
+    // --- 3. REPO AGE CHECK (GitHub / GitLab / Codeberg) ---
+    if (allRepos.length > 0) {
+        console.log(`[REPO CHECK] Found ${allRepos.length} unique ${isEdit ? "new " : ""}repo links to check.`);
+    }
+    const rateLimitedHosts = new Set<RepoHost>();
+    for (const repo of allRepos) {
+        if (rateLimitedHosts.has(repo.host)) continue;
+        const tooNew = await isRepoTooNew(repo);
+        if (tooNew === "rate_limited") {
+            rateLimitedHosts.add(repo.host);
+            continue;
+        }
+        if (tooNew) {
+            await removeForRule(reddit, post, {
+                reasonId: "015176e6-83e3-4b30-8258-47fbb4d2ed16",
+                modNote: `${repo.host} project too new (< 3 months)${isEdit ? ", added in edit" : ""}`,
+                message: projectTooNewMsg,
+                log: `${repo.host} project ${repo.path} too new${isEdit ? " (added in edit)" : ""}.`,
+            });
+            return true;
+        }
+    }
+
+    return false;
 }
 
 // 1. Define the background job that runs AFTER the 5 seconds
@@ -146,154 +317,10 @@ Devvit.addSchedulerJob({
                 console.log(`[FILTERED] Post ${post.id} is held by a filter (Category: ${post.removedByCategory}, spam: ${post.isSpam()}). Running checks, but it will stay in the mod queue.`);
             }
 
-            // --- 1. WEDNESDAY EXCEPTION CHECK ---
-            // Applies to posts with the "Wednesday Exception" or "Personal Dashboard" flair,
-            // and to posts linking to the Apple App Store / Google Play
-            const flairText = post.flair?.text?.toLowerCase() || "";
-            const flairTemplateId = post.flair?.templateId || "";
-            const isWednesdayOnlyFlair =
-                flairText.includes("wednesday exception") ||
-                WEDNESDAY_ONLY_FLAIR_IDS.includes(flairTemplateId);
-            const appStoreLink = [post.url ?? "", post.body ?? "", post.bodyHtml ?? ""].some(hasAppStoreLink);
-            if (isWednesdayOnlyFlair || appStoreLink) {
-                const reason = isWednesdayOnlyFlair ? `Wednesday-only flair ("${post.flair?.text ?? ""}")` : "app store link";
-                if (!isWednesdaySomewhere()) {
-                    await withRetry("post.remove", () => post.remove());
-                    
-                    try {
-                        await withRetry("addRemovalNote", () => post.addRemovalNote({
-                            reasonId: "b82f1872-23b1-468e-8b5d-d2514110fcc2", // Removal UUID, retrieved via API, or APP https://developers.reddit.com/apps/removalreasonids
-                            modNote: `Not Wednesday anywhere, ${reason} [Asimov's Auditor]`
-                        }));
-                        console.log(`[MOD NOTE ADDED] for post ${post.id}`);
-                    } catch (e) {
-                        // Log the error but don't stop the script
-                        console.error(`[MOD NOTE ERROR] Failed to add removal note for ${post.id}:`, e);
-                    }
+            // Rule checks (Wednesday-only content, broken formatting, too-new GitHub/GitLab/Codeberg repo)
+            if (await runRuleChecks(context.reddit, post)) return; // EXIT EARLY: Don't ask the AI question if removed
 
-                    const comment = await context.reddit.submitComment({
-                        id: post.id,
-                        text: isWednesdayOnlyFlair ? wednesdayExceptionMsg : appStoreLinkMsg,
-                    });
-
-                    await withRetry("comment.distinguish", () => comment.distinguish(true));
-                    await withRetry("comment.lock", () => comment.lock());
-                    console.log(`[POST REMOVED] Post ${post.id} removed: ${reason} posted outside Wednesday.`);
-                    
-                    return; // EXIT EARLY: Don't check GitHub or AI if removed for Wednesday
-                } else {
-                    console.log(`[WEDNESDAY CHECK] Passed. It is Wednesday somewhere.`);
-                }
-            }
-
-            // --- 2. LOW EFFORT CHECK: AI-formatted text with unrendered markdown (literal **bold** / ## headings) ---
-            const markdown = detectUnrenderedMarkdown(post.body, post.bodyHtml);
-            if (isUnrenderedMarkdown(markdown)) {
-                await withRetry("post.remove", () => post.remove());
-
-                try {
-                    await withRetry("addRemovalNote", () => post.addRemovalNote({
-                        reasonId: "736f99f9-fcef-49b3-8078-ef9ab306c34f", // Low effort
-                        modNote: `Unrendered markdown (${markdown.bold}x **, ${markdown.headings}x #) [Asimov's Auditor]`
-                    }));
-                    console.log(`[MOD NOTE ADDED] for post ${post.id}`);
-                } catch (e) {
-                    console.error(`[MOD NOTE ERROR] Failed to add removal note for ${post.id}:`, e);
-                }
-
-                const comment = await context.reddit.submitComment({
-                    id: post.id,
-                    text: lowEffortFormattingMsg,
-                });
-
-                await withRetry("comment.distinguish", () => comment.distinguish(true));
-                await withRetry("comment.lock", () => comment.lock());
-                console.log(`[POST REMOVED] Post ${post.id} removed: low effort, unrendered markdown (bold: ${markdown.bold}, headings: ${markdown.headings}).`);
-
-                return; // EXIT EARLY: Don't check GitHub or AI
-            }
-
-            // --- 3. GITHUB REPO AGE CHECK ---
-            const urlRepos = getGithubRepos(post.url || "");
-            const bodyRepos = getGithubRepos(post.body || "");
-            // Also scan the rendered HTML, which contains the link target (href) of every link behind text
-            const htmlRepos = getGithubRepos(post.bodyHtml || "");
-            const allRepos = dedupeRepos([...urlRepos, ...bodyRepos, ...htmlRepos]);
-            
-            let isTooNew = false;
-
-            if (allRepos.length > 0) {
-                console.log(`[GITHUB CHECK] Found ${allRepos.length} unique GitHub links to check.`);
-            }
-
-            for (const repo of allRepos) {
-                try {
-                    const response = await fetch(`https://api.github.com/repos/${repo.owner}/${repo.repo}`, {
-                        headers: {
-                            'User-Agent': 'Devvit-Selfhosted-Bot',
-                            'Accept': 'application/vnd.github.v3+json'
-                        }
-                    });
-
-                    if (response.ok) {
-                        const data = await response.json();
-                        if (data.created_at) {
-                            const createdAt = new Date(data.created_at);
-                            const threeMonthsAgo = new Date();
-                            threeMonthsAgo.setMonth(threeMonthsAgo.getMonth() - 3);
-                            
-                            if (createdAt > threeMonthsAgo) {
-                                isTooNew = true;
-                                console.log(`[GITHUB CHECK] Repo ${repo.owner}/${repo.repo} is too new (${data.created_at}).`);
-                                break; // Stop checking if we find at least one new repo
-                            } else {
-                                console.log(`[GITHUB CHECK] Repo ${repo.owner}/${repo.repo} is old enough.`);
-                            }
-                        }
-                    } else {
-                        // THIS LOG WILL TELL YOU IF GITHUB IS RATE LIMITING YOU
-                        console.error(`[GITHUB API ERROR] Failed to fetch ${repo.owner}/${repo.repo}. Status: ${response.status} ${response.statusText}`);
-                        
-                        // If rate limited (403/429), stop querying to avoid permanent bans
-                        if (response.status === 403 || response.status === 429) break;
-                    }
-                } catch (apiError) {
-                    console.error(`[ERROR] Failed to fetch GitHub API for ${repo.owner}/${repo.repo}:`, apiError);
-                }
-            }
-
-            // If a repo is less than 3 months old, remove it and exit early
-            if (isTooNew) {
-                await withRetry("post.remove", () => post.remove());
-                
-                try {
-                    // Add the internal mod note for the removal reason
-                    await withRetry("addRemovalNote", () => post.addRemovalNote({
-                        reasonId: "015176e6-83e3-4b30-8258-47fbb4d2ed16", // Removal UUID, retrieved via API, or APP https://developers.reddit.com/apps/removalreasonids
-                        modNote: "GitHub project too new (< 3 months) [Asimov's Auditor]"
-                    }));
-                    console.log(`[MOD NOTE ADDED] for post ${post.id}`);
-                } catch (e) {
-                    // Log the error but don't stop the script
-                    console.error(`[MOD NOTE ERROR] Failed to add removal note for ${post.id}:`, e);
-                }
-
-                console.log(`[POST REMOVED] Post ${post.id} removed: GitHub project too new.`);
-
-                const comment = await context.reddit.submitComment({
-                    id: post.id,
-                    text: projectTooNewMsg,
-                });
-
-                await withRetry("comment.distinguish", () => comment.distinguish(true));
-                await withRetry("comment.lock", () => comment.lock()); // Lock the comment so users can't reply to it
-                console.log(`[COMMENT PINNED & LOCKED] Pinned comment added to post ${post.id}`);
-                
-                return; // IMPORTANT: Exit the job here so we don't proceed to the AI check.
-            }
-
-
-            // --- AI QUESTION CHECK (Runs only if GitHub check passes) ---
+            // --- AI QUESTION CHECK (Runs only if the rule checks pass) ---
             if (isFiltered) {
                 // Already removed by the filter. Don't remove it again, or it would leave the mod queue.
                 console.log(`[POST KEPT IN QUEUE] Post ${post.id} is filtered (Category: ${post.removedByCategory}); not removing, only asking the AI question.`);
@@ -544,7 +571,56 @@ Devvit.addTrigger({
     }
 });
 
-// 4. TRIGGER: When a post gets approved, delete the bot's "waiting for manual review" notice
+// 4. TRIGGER: When a post is edited, run the rule checks again on whatever the edit added
+// (e.g. a link to a brand-new GitHub repo added after the bot's first check)
+Devvit.addTrigger({
+    event: "PostUpdate",
+    async onEvent(event, context) {
+        const postId = event.post?.id;
+        if (!postId) return;
+
+        try {
+            const post = await withRetry("getPostById", () => context.reddit.getPostById(postId));
+            if (post.authorName.toLowerCase() === "automoderator") return;
+            // Only body edits matter (title and links can't be edited)
+            if ((post.body ?? "") === (event.previousBody ?? "")) return;
+            // Edits right after posting are picked up by delayed_post_check itself (it reads the post 5s after submit)
+            if (Date.now() - post.createdAt.getTime() < 60 * 1000) return;
+
+            const appUser = await withRetry("getAppUser", () => context.reddit.getAppUser());
+            const appUsername = appUser.username.toLowerCase();
+
+            // Leave posts alone that were deleted, removed by Reddit admins, or removed by a human moderator
+            const isFiltered = FILTER_REMOVAL_CATEGORIES.includes(post.removedByCategory ?? "");
+            if (["deleted", "author", "content_takedown"].includes(post.removedByCategory ?? "")) return;
+            const removedByBot = post.isRemoved() && (post.removedBy ?? "").toLowerCase() === appUsername;
+            if (post.isRemoved() && !isFiltered && !removedByBot) {
+                console.log(`[EDIT SKIPPED] Post ${post.id} was removed by u/${post.removedBy ?? "unknown"}. Not interacting.`);
+                return;
+            }
+
+            // Removed by the bot: only re-check while it's waiting for the AI answer (not after a rule removal or timeout)
+            const aiQuestions = await findBotComments(context.reddit, post.id, appUsername, AI_QUESTION_MARKER);
+            if (removedByBot && aiQuestions.length === 0) return;
+
+            if (!(await runRuleChecks(context.reddit, post, event.previousBody ?? ""))) return;
+
+            // The post is gone for good now: answering the AI question must no longer approve it
+            for (const question of aiQuestions) {
+                await withRetry("aiQuestion.edit", () => question.edit({ text: aiQuestionWithdrawn }));
+                await withRetry("aiQuestion.lock", () => question.lock());
+                await withRetry("aiQuestion.approve", () => question.approve());
+            }
+            for (const notice of await findBotComments(context.reddit, post.id, appUsername, REVIEW_PENDING_MARKER)) {
+                await withRetry("notice.delete", () => notice.delete());
+            }
+        } catch (error) {
+            console.error(`[ERROR] Failed to process PostUpdate for ${postId}:`, error);
+        }
+    }
+});
+
+// 5. TRIGGER: When a post gets approved, delete the bot's "waiting for manual review" notice
 Devvit.addTrigger({
     event: "ModAction",
     async onEvent(event, context) {

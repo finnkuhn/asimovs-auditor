@@ -3,7 +3,7 @@
   "name": "asimovs-auditor",
   "blocks": {
     "entry": "src/main.ts",
-    "triggers": ["onPostSubmit", "onCommentSubmit", "onModAction"],
+    "triggers": ["onPostSubmit", "onCommentSubmit", "onModAction", "onPostUpdate"],
     "menu": { "enable": false },
     "forms": { "enable": false },
     "settings": { "enable": false }
@@ -21,7 +21,7 @@
     },
     "http": {
       "enable": true,
-      "domains": ["api.github.com"]
+      "domains": ["api.github.com", "gitlab.com", "codeberg.org"]
     }
   }
 }
