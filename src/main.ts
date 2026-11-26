@@ -43,6 +43,11 @@ const WEDNESDAY_ONLY_FLAIR_IDS = [
 // "reddit" = Reddit's spam / reputation filters, "automod_filtered" = AutoModerator `action: filter`
 const FILTER_REMOVAL_CATEGORIES = ["reddit", "automod_filtered"];
 
+// removedByCategory values for content Reddit itself took down (shown as "[ Removed by Reddit ]"). Mods can't
+// approve these, so the bot removes them from the mod queue (see queue_cleanup).
+const REDDIT_TAKEDOWN_CATEGORIES = ["content_takedown", "anti_evil_ops", "community_ops", "copyright_takedown"];
+const QUEUE_CLEANUP_CRON = "*/15 * * * *"; // every 15 minutes
+
 // Helper: Check if it is Wednesday ANYWHERE on Earth
 function isWednesdaySomewhere(): boolean {
     const now = new Date();
@@ -501,6 +506,51 @@ Devvit.addSchedulerJob({
         }
     }
 });
+
+// Was this post/comment taken down by Reddit ("[ Removed by Reddit ]")?
+function isRemovedByReddit(item: Post | Comment): boolean {
+    const category = "removedByCategory" in item ? item.removedByCategory : undefined;
+    if (REDDIT_TAKEDOWN_CATEGORIES.includes(category ?? "")) return true;
+    return /^\[\s*removed by reddit\s*\]$/i.test((item.body ?? "").trim());
+}
+
+// Runs every 15 minutes: re-reads the mod queue and removes everything Reddit already took down,
+// so "[ Removed by Reddit ]" items don't sit in the queue
+Devvit.addSchedulerJob({
+    name: 'queue_cleanup',
+    onRun: async (_event, context) => {
+        try {
+            const subreddit = await withRetry("getCurrentSubreddit", () => context.reddit.getCurrentSubreddit());
+            const queue = await withRetry("getModQueue", () => subreddit.getModQueue({ type: "all", limit: 100 }).all());
+            for (const item of queue.filter(isRemovedByReddit)) {
+                try {
+                    await withRetry("queueItem.remove", () => item.remove());
+                    const category = "removedByCategory" in item ? item.removedByCategory : undefined;
+                    console.log(`[QUEUE CLEANUP] Removed ${item.id} from the mod queue: removed by Reddit (Category: ${category ?? "none"}).`);
+                } catch (e) {
+                    console.error(`[ERROR] Failed to remove ${item.id} (removed by Reddit) from the mod queue:`, e);
+                }
+            }
+        } catch (error) {
+            console.error(`[ERROR] in queue_cleanup:`, error);
+        }
+    }
+});
+
+// (Re)start the queue_cleanup cron job whenever the app is installed or upgraded
+async function scheduleQueueCleanup(context: { scheduler: Devvit.Context["scheduler"] }): Promise<void> {
+    try {
+        for (const job of await context.scheduler.listJobs()) {
+            if (job.name === "queue_cleanup") await context.scheduler.cancelJob(job.id);
+        }
+        await context.scheduler.runJob({ name: "queue_cleanup", cron: QUEUE_CLEANUP_CRON });
+        console.log(`[QUEUE CLEANUP] Scheduled (${QUEUE_CLEANUP_CRON}).`);
+    } catch (e) {
+        console.error(`[ERROR] Failed to schedule queue_cleanup:`, e);
+    }
+}
+Devvit.addTrigger({ event: "AppInstall", onEvent: async (_event, context) => scheduleQueueCleanup(context) });
+Devvit.addTrigger({ event: "AppUpgrade", onEvent: async (_event, context) => scheduleQueueCleanup(context) });
 
 // 2. TRIGGER: When a new post is submitted
 Devvit.addTrigger({

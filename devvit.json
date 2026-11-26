@@ -3,7 +3,7 @@
   "name": "asimovs-auditor",
   "blocks": {
     "entry": "src/main.ts",
-    "triggers": ["onPostSubmit", "onCommentSubmit", "onModAction", "onPostUpdate"],
+    "triggers": ["onPostSubmit", "onCommentSubmit", "onModAction", "onPostUpdate", "onAppInstall", "onAppUpgrade"],
     "menu": { "enable": false },
     "forms": { "enable": false },
     "settings": { "enable": false }
